@@ -10,12 +10,20 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from factor_backtester.backtest import BacktestConfig, run_backtest
-from factor_backtester.benchmark import BENCHMARK_ETFS, benchmark_comparison_table, get_benchmark_curves
-from factor_backtester.data import get_fundamentals, get_prices
-from factor_backtester.factors import composite_score, momentum, quality, value
-from factor_backtester.metrics import max_drawdown, performance_summary
-from factor_backtester.universe import load_sp500
+from factor_backtester.backtest import BacktestConfig, run_backtest  # noqa: E402
+from factor_backtester.benchmark import (  # noqa: E402
+    BENCHMARK_ETFS,
+    benchmark_comparison_table,
+    get_benchmark_curves,
+)
+from factor_backtester.data import get_fundamentals, get_prices  # noqa: E402
+from factor_backtester.factors import (  # noqa: E402
+    composite_score,
+    momentum,
+    quality,
+    value,
+)
+from factor_backtester.universe import load_sp500  # noqa: E402
 
 st.set_page_config(page_title="Factor Backtester", layout="wide")
 st.title("Multi-Factor Equity Backtester")
@@ -44,8 +52,8 @@ log_scale = st.sidebar.checkbox("Log scale", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "**Caveat:** Uses current S&P 500 constituents — results have survivorship bias. "
-    "See CAVEATS.md for full list of limitations."
+    "**Caveat:** Uses current S&P 500 constituents — results have "
+    "survivorship bias. See CAVEATS.md for full list of limitations."
 )
 
 run_button = st.sidebar.button("Run Backtest", type="primary")
@@ -53,7 +61,6 @@ run_button = st.sidebar.button("Run Backtest", type="primary")
 if run_button:
     with st.spinner("Loading universe and data..."):
         tickers = load_sp500()
-
         prices = get_prices(tickers, start_str, end_str)
         fundamentals = get_fundamentals(list(prices.columns))
 
@@ -85,23 +92,31 @@ if run_button:
         result = run_backtest(prices, make_score_fn(factor_choice), config)
 
     with st.spinner("Loading benchmarks..."):
-        bench_curves = get_benchmark_curves(start_str, end_str, config.initial_capital)
+        bench_curves = get_benchmark_curves(
+            start_str, end_str, config.initial_capital
+        )
 
     # --- Equity Curve ---
     st.subheader("Equity Curve")
     fig_eq = go.Figure()
     fig_eq.add_trace(go.Scatter(
-        x=result.equity_curve.index, y=result.equity_curve.values,
-        name=f"Strategy ({factor_choice})", line=dict(width=2),
+        x=result.equity_curve.index,
+        y=result.equity_curve.values,
+        name=f"Strategy ({factor_choice})",
+        line=dict(width=2),
     ))
     for ticker, curve in bench_curves.items():
         label = BENCHMARK_ETFS.get(ticker, ticker)
         fig_eq.add_trace(go.Scatter(
-            x=curve.index, y=curve.values, name=label, line=dict(width=1, dash="dash"),
+            x=curve.index, y=curve.values,
+            name=label, line=dict(width=1, dash="dash"),
         ))
     if log_scale:
         fig_eq.update_yaxes(type="log")
-    fig_eq.update_layout(height=500, xaxis_title="Date", yaxis_title="Portfolio Value ($)")
+    fig_eq.update_layout(
+        height=500, xaxis_title="Date",
+        yaxis_title="Portfolio Value ($)",
+    )
     st.plotly_chart(fig_eq, use_container_width=True)
 
     # --- Drawdown Chart ---
@@ -110,10 +125,13 @@ if run_button:
     dd = (result.equity_curve - cummax) / cummax
     fig_dd = go.Figure()
     fig_dd.add_trace(go.Scatter(
-        x=dd.index, y=dd.values, fill="tozeroy", name="Drawdown",
-        line=dict(color="red", width=1),
+        x=dd.index, y=dd.values, fill="tozeroy",
+        name="Drawdown", line=dict(color="red", width=1),
     ))
-    fig_dd.update_layout(height=300, yaxis_title="Drawdown", yaxis_tickformat=".0%")
+    fig_dd.update_layout(
+        height=300, yaxis_title="Drawdown",
+        yaxis_tickformat=".0%",
+    )
     st.plotly_chart(fig_dd, use_container_width=True)
 
     # --- Rolling 12-month return ---
@@ -121,43 +139,61 @@ if run_button:
     rolling_ret = result.equity_curve.pct_change(252).dropna()
     fig_roll = go.Figure()
     fig_roll.add_trace(go.Scatter(
-        x=rolling_ret.index, y=rolling_ret.values, name="Rolling 12M Return",
-        line=dict(width=1),
+        x=rolling_ret.index, y=rolling_ret.values,
+        name="Rolling 12M Return", line=dict(width=1),
     ))
     fig_roll.update_layout(height=300, yaxis_tickformat=".0%")
     st.plotly_chart(fig_roll, use_container_width=True)
 
     # --- Metrics Table ---
     st.subheader("Performance Metrics")
-    comp_table = benchmark_comparison_table(result.equity_curve, bench_curves)
+    comp_table = benchmark_comparison_table(
+        result.equity_curve, bench_curves
+    )
     comp_table.loc["total_transaction_costs"] = 0.0
-    comp_table.at["total_transaction_costs", "Strategy"] = result.costs_paid
+    comp_table.at[
+        "total_transaction_costs", "Strategy"
+    ] = result.costs_paid
 
-    format_pct = ["cagr", "annualized_volatility", "max_drawdown", "win_rate", "best_month", "worst_month"]
-    display = comp_table.copy()
-    for row in format_pct:
-        if row in display.index:
-            display.loc[row] = display.loc[row].apply(lambda x: f"{x:.2%}")
+    display = comp_table.astype(str).copy()
+    fmt_pct = [
+        "cagr", "annualized_volatility", "max_drawdown",
+        "win_rate", "best_month", "worst_month",
+    ]
+    for row in fmt_pct:
+        if row in comp_table.index:
+            for col in comp_table.columns:
+                v = float(comp_table.at[row, col])
+                display.at[row, col] = f"{v:.2%}"
     for row in ["sharpe_ratio", "sortino_ratio", "calmar_ratio"]:
-        if row in display.index:
-            display.loc[row] = display.loc[row].apply(lambda x: f"{x:.2f}")
-    if "max_drawdown_duration_days" in display.index:
-        display.loc["max_drawdown_duration_days"] = display.loc["max_drawdown_duration_days"].apply(
-            lambda x: f"{int(float(x))}d"
-        )
-    if "total_transaction_costs" in display.index:
-        display.loc["total_transaction_costs"] = display.loc["total_transaction_costs"].apply(
-            lambda x: f"${float(x):,.0f}"
-        )
+        if row in comp_table.index:
+            for col in comp_table.columns:
+                v = float(comp_table.at[row, col])
+                display.at[row, col] = f"{v:.2f}"
+    if "max_drawdown_duration_days" in comp_table.index:
+        for col in comp_table.columns:
+            v = comp_table.at["max_drawdown_duration_days", col]
+            display.at["max_drawdown_duration_days", col] = (
+                f"{int(float(v))}d"
+            )
+    if "total_transaction_costs" in comp_table.index:
+        for col in comp_table.columns:
+            v = comp_table.at["total_transaction_costs", col]
+            display.at["total_transaction_costs", col] = (
+                f"${float(v):,.0f}"
+            )
 
     st.dataframe(display, use_container_width=True)
 
     # --- Current Holdings ---
     st.subheader("Current Holdings (Latest Rebalance)")
     if not result.holdings.empty:
-        last_holdings = result.holdings.iloc[-1].dropna().sort_values(ascending=False)
+        last = result.holdings.iloc[-1].dropna()
+        last = last.sort_values(ascending=False)
         st.dataframe(
-            last_holdings.reset_index().rename(columns={"index": "Ticker", last_holdings.name: "Weight"}),
+            last.reset_index().rename(
+                columns={"index": "Ticker", last.name: "Weight"}
+            ),
             use_container_width=True,
         )
     else:
@@ -167,9 +203,17 @@ if run_button:
     st.subheader("Monthly Turnover")
     if len(result.turnover) > 0:
         fig_turn = go.Figure()
-        fig_turn.add_trace(go.Bar(x=result.turnover.index, y=result.turnover.values, name="Turnover"))
+        fig_turn.add_trace(go.Bar(
+            x=result.turnover.index,
+            y=result.turnover.values,
+            name="Turnover",
+        ))
         fig_turn.update_layout(height=300, yaxis_tickformat=".0%")
         st.plotly_chart(fig_turn, use_container_width=True)
-        st.metric("Average Turnover", f"{result.turnover.mean():.1%}")
+        st.metric(
+            "Average Turnover", f"{result.turnover.mean():.1%}"
+        )
 
-    st.metric("Total Transaction Costs", f"${result.costs_paid:,.2f}")
+    st.metric(
+        "Total Transaction Costs", f"${result.costs_paid:,.2f}"
+    )
