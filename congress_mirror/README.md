@@ -33,6 +33,42 @@ python run_mirror.py start             # scheduler: runs now + every weekday 09:
 **Start here:** run `python run_mirror.py diagnose` first. It tells you which
 data source is reachable from your machine and whether Alpaca is connected.
 
+## Data sources
+
+The data layer tries these in order, using the first one that produces rows:
+
+1. **Manual file** at `data/congress_trades.json` or `data/congress_trades.csv`
+   (whatever you drop in overrides everything else).
+2. **capitoltrades.com BFF JSON API** via `curl_cffi` — uses a real Chrome TLS
+   fingerprint, so Cloudflare lets it through. This is the primary online source
+   and covers both chambers.
+3. **House + Senate Stock Watcher** public S3 buckets (legacy; usually returns
+   403 now but we still try in case they come back).
+
+If the online sources are blocked from your network, **the manual file is the
+escape hatch**.
+
+### Manual file schema
+
+`data/congress_trades.json` — array of objects with these fields:
+
+```json
+[
+  {
+    "ticker": "NVDA",
+    "type": "buy",                       // or "sell" / "purchase" / "sale"
+    "date": "2026-05-30",                // YYYY-MM-DD
+    "amount": "$50,001 - $100,000",      // STOCK Act range or numeric mid
+    "politician_name": "Nancy Pelosi",
+    "chamber": "house"                   // or "senate"
+  }
+]
+```
+
+CSV equivalent uses the same column names. Generate this file from any source
+you trust (a paid API, a manual export, etc.) and the daily cycle will pick it
+up automatically.
+
 ## How it works
 
 1. **Data** — downloads structured congressional trade disclosures from the

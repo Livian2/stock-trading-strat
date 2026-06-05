@@ -124,27 +124,48 @@ def cmd_diagnose() -> None:
             print(f"  FAIL {host}: {e}")
 
     print("\n=== Data sources (HTTP) ===")
+    # capitoltrades via curl_cffi (primary)
+    try:
+        from curl_cffi import requests as cffi_requests
+        s = cffi_requests.Session(impersonate="chrome120")
+        s.headers.update({
+            "Accept":  "application/json, text/plain, */*",
+            "Referer": "https://www.capitoltrades.com/trades",
+            "Origin":  "https://www.capitoltrades.com",
+        })
+        # Warm-up
+        s.get("https://www.capitoltrades.com/trades", timeout=30)
+        r = s.get(CAPITOL_BFF, params={"page": 1, "pageSize": 5}, timeout=30)
+        try:
+            n = len((r.json() or {}).get("data") or []) if r.status_code == 200 else 0
+        except Exception:
+            n = 0
+        print(f"  capitoltrades BFF via curl_cffi: HTTP {r.status_code}  ({n} sample records)")
+    except ImportError:
+        print("  capitoltrades BFF: curl_cffi NOT INSTALLED  (run: pip install curl_cffi)")
+    except Exception as e:
+        print(f"  capitoltrades BFF: ERROR {e}")
+
+    # Stock Watcher S3 (legacy)
     for label, url in (("House Stock Watcher",  HOUSE_SW_URL),
                        ("Senate Stock Watcher", SENATE_SW_URL)):
         try:
-            r = requests.get(url, timeout=60, headers={"User-Agent": _UA}, stream=True)
+            r = requests.get(url, timeout=30, headers={"User-Agent": _UA}, stream=True)
             n = len(r.json()) if r.status_code == 200 else 0
             print(f"  {label}: HTTP {r.status_code}  ({n} records)")
         except Exception as e:
             print(f"  {label}: ERROR {e}")
 
-    try:
-        sess = requests.Session()
-        try:
-            import cloudscraper
-            sess = cloudscraper.create_scraper()
-        except ImportError:
-            print("  (cloudscraper not installed; capitoltrades likely blocked)")
-        r = sess.get(CAPITOL_BFF, params={"page": 1, "pageSize": 5}, timeout=30,
-                     headers={"User-Agent": _UA})
-        print(f"  capitoltrades BFF: HTTP {r.status_code}")
-    except Exception as e:
-        print(f"  capitoltrades BFF: ERROR {e}")
+    # Manual file
+    from pathlib import Path
+    manual = Path("data/congress_trades.json")
+    manual_csv = Path("data/congress_trades.csv")
+    if manual.exists():
+        print(f"  Manual file: {manual}  ({manual.stat().st_size} bytes)")
+    elif manual_csv.exists():
+        print(f"  Manual file: {manual_csv}  ({manual_csv.stat().st_size} bytes)")
+    else:
+        print("  Manual file: none  (drop data/congress_trades.json to override)")
 
     print("\n=== Alpaca ===")
     try:

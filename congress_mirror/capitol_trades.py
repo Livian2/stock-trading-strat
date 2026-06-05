@@ -3,21 +3,25 @@ Congressional trade data.
 
 The problem
 -----------
-- capitoltrades.com sits behind Cloudflare and blocks scripted requests.
-- The official House/Senate clerk sites only publish PDFs (not machine-readable
-  transaction rows), so they cannot drive an automated strategy.
+- capitoltrades.com is behind Cloudflare and rejects basic scripted requests
+  (HTTP 403/503). `requests` and `cloudscraper` both fail against modern
+  Cloudflare because their TLS fingerprints don't match real browsers.
+- The official House/Senate clerk sites only publish PDFs.
+- Public S3 datasets (House/Senate Stock Watcher) have been taken down.
 
 The solution
 ------------
-Use already-parsed, structured, public datasets. We try several sources in
-order and use the first that returns data. Everything is downloaded ONCE per
-run and cached in memory (call ``clear_cache()`` at the start of each daily
-cycle to force a refresh).
+Three data paths, tried in order. Whichever works first wins. Data is
+downloaded ONCE per run and cached in memory; call ``clear_cache()`` at the
+start of each daily cycle to force a refresh.
 
 Sources (in priority order)
-    1. House Stock Watcher  – public S3 JSON, no auth   (House reps)
-    2. Senate Stock Watcher – public S3 JSON, no auth   (Senators)
-    3. capitoltrades.com    – BFF JSON API via cloudscraper (both chambers)
+    1. capitoltrades.com BFF JSON API via ``curl_cffi`` (mimics Chrome's
+       real TLS fingerprint; defeats Cloudflare). Covers both chambers.
+    2. House + Senate Stock Watcher S3 JSON (legacy; usually 403 now but
+       cheap to try in case the bucket comes back).
+    3. Manual file: ``data/congress_trades.json`` or ``.csv`` exported from
+       capitoltrades.com or any other source. See README for the schema.
 
 Public interface
     clear_cache()
@@ -31,11 +35,14 @@ trade_dict schema
 """
 from __future__ import annotations
 
+import csv
+import json
 import logging
 import re
 import time
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import requests
 
@@ -196,19 +203,47 @@ def _load_stockwatcher(url: str, chamber: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Source 3: capitoltrades.com BFF JSON API (fallback) via cloudscraper
+# Source 1 (primary): capitoltrades.com BFF JSON API via curl_cffi
 # ---------------------------------------------------------------------------
+# curl_cffi uses the real Chrome TLS fingerprint, which is currently the only
+# reliable way to pass Cloudflare for this site. cloudscraper / requests get
+# rejected because their TLS handshakes look like bots.
 
 def _bff_session():
+    """Return a session that can pass Cloudflare. Prefer curl_cffi."""
+    try:
+        from curl_cffi import requests as cffi_requests
+        s = cffi_requests.Session(impersonate="chrome120")
+        s.headers.update({
+            "Accept":          "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin":          "https://www.capitoltrades.com",
+            "Referer":         "https://www.capitoltrades.com/trades",
+            "Sec-Fetch-Dest":  "empty",
+            "Sec-Fetch-Mode":  "cors",
+            "Sec-Fetch-Site":  "same-site",
+        })
+        # Warm-up: visit the main page so we collect any cf_clearance cookies
+        try:
+            s.get("https://www.capitoltrades.com/trades", timeout=30)
+        except Exception:
+            pass
+        return s, "curl_cffi"
+    except ImportError:
+        pass
+
+    # Last-ditch fallback (will likely fail with 403/503)
     try:
         import cloudscraper
         return cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
+        ), "cloudscraper"
     except ImportError:
-        s = requests.Session()
-        s.headers.update({"User-Agent": _UA, "Accept": "application/json"})
-        return s
+        pass
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": _UA, "Accept": "application/json"})
+    return s, "requests"
 
 
 def _normalize_bff_trade(raw: dict) -> dict | None:
@@ -258,13 +293,21 @@ def _normalize_bff_trade(raw: dict) -> dict | None:
 
 def _load_capitoltrades(days: int) -> list[dict]:
     cutoff = datetime.now(tz=UTC) - timedelta(days=days)
-    session = _bff_session()
+    session, backend = _bff_session()
+    logger.info("capitoltrades.com via %s", backend)
     out: list[dict] = []
     page = 1
     while True:
-        params = {"page": page, "pageSize": 100, "sortBy": "-txDate"}
-        logger.info("capitoltrades BFF page %d …", page)
+        params = {"page": page, "pageSize": 96, "sortBy": "-txDate"}
+        logger.info("  page %d …", page)
         r = session.get(CAPITOL_BFF, params=params, timeout=30)
+        if r.status_code in (403, 503):
+            raise RuntimeError(
+                f"capitoltrades.com blocked (HTTP {r.status_code}). "
+                "Install curl_cffi (`pip install curl_cffi`) for a working "
+                "TLS fingerprint, or drop a manual export at "
+                "data/congress_trades.json."
+            )
         r.raise_for_status()
         payload = r.json()
         rows = payload.get("data") or []
@@ -286,10 +329,88 @@ def _load_capitoltrades(days: int) -> list[dict]:
         if stop or page >= total_pages:
             break
         page += 1
-        time.sleep(1.0)
+        time.sleep(0.5)
 
     logger.info("  capitoltrades: %d usable trades", len(out))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Source 3: manual file dropped by user at data/congress_trades.{json,csv}
+# ---------------------------------------------------------------------------
+# Schema (JSON): a list of objects, each with these keys (camel or snake):
+#   ticker, type ("buy"|"sell"|"purchase"|"sale"), date (YYYY-MM-DD),
+#   amount (range string or numeric), politician_name, chamber ("house"|"senate")
+# CSV equivalent uses the same column names.
+
+_MANUAL_PATHS = [
+    Path(__file__).parent.parent / "data" / "congress_trades.json",
+    Path(__file__).parent.parent / "data" / "congress_trades.csv",
+]
+
+
+def _load_manual_file() -> list[dict]:
+    for path in _MANUAL_PATHS:
+        if not path.exists():
+            continue
+        logger.info("Loading manual export from %s", path)
+        rows: list[dict]
+        if path.suffix == ".json":
+            rows = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(rows, dict):
+                rows = rows.get("data") or rows.get("transactions") or []
+        else:
+            with path.open(encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+
+        out: list[dict] = []
+        for r in rows:
+            t = _normalize_manual_row(r)
+            if t is not None:
+                out.append(t)
+        logger.info("  manual file: %d usable trades", len(out))
+        return out
+    return []
+
+
+def _normalize_manual_row(row: dict) -> dict | None:
+    try:
+        ticker = _norm_ticker(row.get("ticker") or row.get("Ticker") or "")
+        if ticker is None:
+            return None
+        ttype = _norm_type(row.get("type") or row.get("Type") or row.get("transactionType") or "")
+        if ttype is None:
+            return None
+        date = _parse_date(str(
+            row.get("date") or row.get("Date")
+            or row.get("transaction_date") or row.get("TransactionDate") or ""
+        ))
+        if date is None:
+            return None
+        name = _clean_name(
+            row.get("politician_name") or row.get("politicianName")
+            or row.get("representative") or row.get("senator") or row.get("name") or ""
+        )
+        if not name:
+            return None
+        amount = row.get("amount") or row.get("Amount") or ""
+        try:
+            amount_mid = float(amount) if str(amount).replace(".", "", 1).isdigit() else _parse_amount(str(amount))
+        except (TypeError, ValueError):
+            amount_mid = _parse_amount(str(amount))
+        chamber = (row.get("chamber") or "").lower() or "unknown"
+        return {
+            "ticker":          ticker,
+            "type":            ttype,
+            "amount":          str(amount),
+            "amount_mid":      amount_mid or 8_000,
+            "date":            date,
+            "politician_name": name,
+            "politician_id":   _slugify(name),
+            "chamber":         chamber,
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -306,29 +427,37 @@ def clear_cache() -> None:
 
 
 def _load_from_sources(days: int) -> list[dict]:
+    # 1. Manual file overrides everything (offline / explicit user choice)
+    manual = _load_manual_file()
+    if manual:
+        return manual
+
     collected: list[dict] = []
 
-    # Sources 1 & 2: Stock Watcher (combine House + Senate when available)
-    for url, chamber in ((HOUSE_SW_URL, "house"), (SENATE_SW_URL, "senate")):
-        try:
-            collected.extend(_load_stockwatcher(url, chamber))
-        except Exception as e:
-            logger.warning("%s Stock Watcher unavailable: %s", chamber.title(), e)
+    # 2. capitoltrades.com BFF (primary online source)
+    try:
+        collected = _load_capitoltrades(days)
+    except Exception as e:
+        logger.warning("capitoltrades.com unavailable: %s", e)
 
-    # Source 3: capitoltrades fallback only if the above produced nothing
+    # 3. Stock Watcher S3 buckets (legacy; usually 403 now)
     if not collected:
-        try:
-            collected = _load_capitoltrades(days)
-        except Exception as e:
-            logger.warning("capitoltrades.com unavailable: %s", e)
+        for url, chamber in ((HOUSE_SW_URL, "house"), (SENATE_SW_URL, "senate")):
+            try:
+                collected.extend(_load_stockwatcher(url, chamber))
+            except Exception as e:
+                logger.warning("%s Stock Watcher unavailable: %s", chamber.title(), e)
 
     if not collected:
         raise RuntimeError(
-            "All congressional data sources failed. Check your internet connection. "
-            "Run `python run_mirror.py diagnose` to see which source is reachable."
+            "All congressional data sources failed.\n"
+            "  Try: pip install curl_cffi   (real Chrome TLS fingerprint)\n"
+            "  Then: python run_mirror.py diagnose\n"
+            "  Or:  drop a manual export at data/congress_trades.json\n"
+            "       (schema in congress_mirror/README.md)"
         )
 
-    logger.info("Total trades loaded across all sources: %d", len(collected))
+    logger.info("Total trades loaded: %d", len(collected))
     return collected
 
 
