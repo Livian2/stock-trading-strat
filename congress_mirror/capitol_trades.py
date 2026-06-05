@@ -1,17 +1,26 @@
 """
-Scraper for capitoltrades.com.
+Congressional trade data.
 
-Strategy:
-  1. Try to extract the embedded Next.js __NEXT_DATA__ JSON (fast, no HTML parsing).
-  2. Fall back to BeautifulSoup HTML parsing.
-  3. Paginate automatically until all records are collected.
+Source priority
+---------------
+1. capitoltrades.com  – covers both House + Senate; uses cloudscraper to
+                        bypass Cloudflare bot protection.
+2. Official House PTR  – fallback ZIP/CSV from disclosures-clerk.house.gov;
+                         only House members but 100 % reliable.
+
+Both sources expose the same public interface:
+    get_politicians() -> list[dict]
+    get_politician_trades(politician_id, days) -> list[dict]
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import re
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -19,70 +28,90 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# HTTP session — prefer cloudscraper (handles Cloudflare JS challenges)
+# ---------------------------------------------------------------------------
+try:
+    import cloudscraper as _cs
+    _session = _cs.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    logger.debug("HTTP client: cloudscraper")
+except ImportError:
+    _session = requests.Session()
+    _session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    logger.warning("cloudscraper not installed – install it with: pip install cloudscraper")
+
 BASE_URL = "https://www.capitoltrades.com"
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-}
-
-# Midpoints of STOCK Act disclosure ranges (used for position sizing / return weighting)
+# Midpoints of STOCK Act disclosure amount ranges
 AMOUNT_MIDPOINTS: dict[str, float] = {
-    "$1,001 - $15,000":       8_000,
-    "$15,001 - $50,000":     32_500,
-    "$50,001 - $100,000":    75_000,
-    "$100,001 - $250,000":  175_000,
-    "$250,001 - $500,000":  375_000,
-    "$500,001 - $1,000,000": 750_000,
+    "$1,001 - $15,000":           8_000,
+    "$15,001 - $50,000":         32_500,
+    "$50,001 - $100,000":        75_000,
+    "$100,001 - $250,000":      175_000,
+    "$250,001 - $500,000":      375_000,
+    "$500,001 - $1,000,000":    750_000,
     "$1,000,001 - $5,000,000": 3_000_000,
-    "Over $5,000,000":       5_000_000,
+    "Over $5,000,000":         5_000_000,
 }
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _parse_amount(text: str) -> float:
-    """Return dollar midpoint for a STOCK Act range string."""
     text = text.strip()
     for pattern, mid in AMOUNT_MIDPOINTS.items():
         if text.lower() in pattern.lower() or pattern.lower() in text.lower():
             return mid
-    # Numeric fallback: strip symbols and parse
     nums = re.findall(r"[\d,]+", text)
     if len(nums) >= 2:
-        lo = float(nums[0].replace(",", ""))
-        hi = float(nums[1].replace(",", ""))
-        return (lo + hi) / 2
+        return (float(nums[0].replace(",", "")) + float(nums[1].replace(",", ""))) / 2
     if len(nums) == 1:
         return float(nums[0].replace(",", ""))
-    return 8_000  # default to smallest range midpoint
+    return 8_000
 
 
-_session = requests.Session()
-_session.headers.update(_HEADERS)
+def _parse_date(text: str) -> datetime | None:
+    text = text.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    return None
 
 
 def _get(url: str, params: dict | None = None, retries: int = 3) -> requests.Response:
-    """GET with retry and polite rate-limiting."""
     for attempt in range(retries):
         try:
             time.sleep(1.5 + attempt)
-            r = _session.get(url, params=params, timeout=20)
+            r = _session.get(url, params=params, timeout=25)
             r.raise_for_status()
             return r
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 429:
-                wait = 10 * (attempt + 1)
-                logger.warning("Rate-limited; sleeping %ds", wait)
+            code = e.response.status_code if e.response is not None else 0
+            if code in (429, 503) and attempt < retries - 1:
+                wait = 8 * (attempt + 1)
+                logger.warning("capitoltrades.com blocked (HTTP %d); waiting %ds", code, wait)
                 time.sleep(wait)
             elif attempt == retries - 1:
                 raise
@@ -94,291 +123,322 @@ def _get(url: str, params: dict | None = None, retries: int = 3) -> requests.Res
 
 
 def _next_data(html: str) -> dict | None:
-    """Extract __NEXT_DATA__ JSON embedded by Next.js, if present."""
-    soup = BeautifulSoup(html, "lxml")
-    tag = soup.find("script", id="__NEXT_DATA__")
+    """Extract __NEXT_DATA__ JSON embedded by Next.js."""
+    tag = BeautifulSoup(html, "lxml").find("script", id="__NEXT_DATA__")
     if tag and tag.string:
         try:
             return json.loads(tag.string)
         except json.JSONDecodeError:
-            return None
+            pass
     return None
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Source 1: capitoltrades.com
 # ---------------------------------------------------------------------------
 
-def get_politicians() -> list[dict]:
-    """
-    Return list of all politicians on capitoltrades.com.
-
-    Each dict has at least: id, name.
-    Optional fields (when available): party, state, trade_count.
-    """
+def _ct_get_politicians() -> list[dict]:
     politicians: list[dict] = []
     page = 1
-
     while True:
-        logger.info("Fetching politicians page %d", page)
+        logger.info("capitoltrades.com politicians page %d", page)
         r = _get(f"{BASE_URL}/politicians", params={"page": page} if page > 1 else None)
-        html = r.text
 
-        # --- Next.js path ---
-        nd = _next_data(html)
+        nd = _next_data(r.text)
         if nd:
             props = nd.get("props", {}).get("pageProps", {})
-            # The data key varies; try common names
             for key in ("politicians", "data", "results", "items"):
                 pols = props.get(key)
                 if isinstance(pols, list) and pols:
-                    for p in pols:
-                        politicians.append(_normalize_politician(p))
-                    pagination = props.get("pagination", props.get("meta", {}))
-                    total = pagination.get("totalPages", pagination.get("total_pages", 1))
-                    if page >= int(total):
+                    politicians.extend(_normalize_ct_politician(p) for p in pols)
+                    pagination = props.get("pagination") or props.get("meta") or {}
+                    total = int(pagination.get("totalPages") or pagination.get("total_pages") or 1)
+                    if page >= total:
                         return politicians
                     page += 1
                     break
             else:
-                break  # Next.js data present but unrecognized shape — fall through to HTML
+                break
             continue
 
-        # --- HTML path ---
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(r.text, "lxml")
         added = 0
-
-        # Pattern A: cards/articles with a link to /politicians/<slug>
-        for elem in soup.find_all("a", href=re.compile(r"/politicians/[^/]+$")):
+        for elem in soup.find_all("a", href=re.compile(r"/politicians/[^/?#]+$")):
             slug = elem["href"].rstrip("/").split("/")[-1]
             if not slug or slug == "politicians":
                 continue
             name = elem.get_text(separator=" ", strip=True)
-            # Avoid duplicates from multiple links to the same politician
             if not any(p["id"] == slug for p in politicians):
-                politicians.append({"id": slug, "name": name})
+                politicians.append({"id": slug, "name": name, "party": "", "state": ""})
             added += 1
 
-        # Pattern B: table rows
         if not added:
-            for row in soup.select("table tbody tr"):
-                link = row.find("a", href=re.compile(r"/politicians/"))
-                if link:
-                    slug = link["href"].rstrip("/").split("/")[-1]
-                    name = link.get_text(strip=True)
-                    if not any(p["id"] == slug for p in politicians):
-                        politicians.append({"id": slug, "name": name})
-                    added += 1
-
-        if not added:
-            logger.warning("No politicians found on page %d; stopping pagination", page)
             break
 
-        # Check for a "next page" link
-        next_link = soup.find(
-            "a",
-            string=re.compile(r"next|›|»|>", re.I),
-        ) or soup.find("a", attrs={"aria-label": re.compile(r"next", re.I)})
-
-        if not next_link or "disabled" in next_link.get("class", []):
+        nxt = soup.find("a", string=re.compile(r"next|›|»", re.I)) or \
+              soup.find("a", attrs={"aria-label": re.compile(r"next", re.I)})
+        if not nxt or "disabled" in nxt.get("class", []):
             break
         page += 1
 
     return politicians
 
 
-def _normalize_politician(raw: dict) -> dict:
-    """Normalise a politician record from either Next.js JSON or HTML."""
-    # Accept camelCase or snake_case keys
+def _normalize_ct_politician(raw: dict) -> dict:
     return {
-        "id":          raw.get("id") or raw.get("politicianId") or raw.get("slug") or "",
-        "name":        raw.get("name") or raw.get("fullName") or raw.get("displayName") or "",
-        "party":       raw.get("party") or "",
-        "state":       raw.get("state") or "",
-        "trade_count": raw.get("tradeCount") or raw.get("trade_count") or 0,
+        "id":    raw.get("id") or raw.get("politicianId") or raw.get("slug") or "",
+        "name":  raw.get("name") or raw.get("fullName") or raw.get("displayName") or "",
+        "party": raw.get("party") or "",
+        "state": raw.get("state") or "",
     }
 
 
-def get_politician_trades(politician_id: str, days: int = 365) -> list[dict]:
-    """
-    Return all trades for a politician over the last `days` days.
-
-    Each dict contains: ticker, type (buy/sell), amount, amount_mid, date.
-    """
+def _ct_get_trades(politician_id: str, days: int) -> list[dict]:
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     trades: list[dict] = []
     page = 1
-
     while True:
         url = f"{BASE_URL}/politicians/{politician_id}"
-        logger.info("Fetching trades for %s page %d", politician_id, page)
-        r = _get(url, params={"page": page, "tab": "trades"} if page > 1 else {"tab": "trades"})
-        html = r.text
+        params = {"tab": "trades"} if page == 1 else {"tab": "trades", "page": page}
+        r = _get(url, params=params)
 
-        # --- Next.js path ---
-        nd = _next_data(html)
+        nd = _next_data(r.text)
         if nd:
             props = nd.get("props", {}).get("pageProps", {})
             raw_trades = (
                 props.get("trades")
-                or props.get("data", {}).get("trades")
+                or (props.get("data") or {}).get("trades")
                 or props.get("data")
                 or []
             )
             if isinstance(raw_trades, list):
                 for t in raw_trades:
-                    parsed = _normalize_trade(t)
+                    parsed = _normalize_ct_trade(t)
                     if parsed and parsed["date"] >= cutoff:
                         trades.append(parsed)
-                pagination = props.get("pagination", props.get("meta", {}))
-                total = int(pagination.get("totalPages", pagination.get("total_pages", 1)))
+                pagination = props.get("pagination") or props.get("meta") or {}
+                total = int(pagination.get("totalPages") or pagination.get("total_pages") or 1)
                 if page >= total:
                     break
                 page += 1
                 continue
 
-        # --- HTML path ---
-        soup = BeautifulSoup(html, "lxml")
-        rows = soup.select("table tbody tr") or soup.select("[data-trade-row]")
-        if not rows:
-            # Try generic row detection: look for ticker-like cells
-            rows = [
-                tr for tr in soup.find_all("tr")
-                if tr.find(string=re.compile(r"^[A-Z]{1,5}$"))
-            ]
-
-        page_had_old = False
+        soup = BeautifulSoup(r.text, "lxml")
+        rows = soup.select("table tbody tr") or [
+            tr for tr in soup.find_all("tr")
+            if tr.find(string=re.compile(r"^[A-Z]{1,5}$"))
+        ]
+        old_on_page = False
         for row in rows:
-            t = _parse_trade_row(row)
+            t = _parse_html_row(row)
             if t is None:
                 continue
             if t["date"] < cutoff:
-                page_had_old = True
-                continue
-            trades.append(t)
-
-        if page_had_old or not rows:
+                old_on_page = True
+            else:
+                trades.append(t)
+        if old_on_page or not rows:
             break
-
-        next_link = soup.find("a", string=re.compile(r"next|›|»", re.I)) or soup.find(
-            "a", attrs={"aria-label": re.compile(r"next", re.I)}
-        )
-        if not next_link or "disabled" in next_link.get("class", []):
+        nxt = soup.find("a", string=re.compile(r"next|›|»", re.I)) or \
+              soup.find("a", attrs={"aria-label": re.compile(r"next", re.I)})
+        if not nxt or "disabled" in nxt.get("class", []):
             break
         page += 1
 
     return trades
 
 
-def _normalize_trade(raw: dict) -> dict | None:
-    """Normalise a trade record from Next.js JSON."""
+def _normalize_ct_trade(raw: dict) -> dict | None:
     try:
         ticker = (
-            raw.get("ticker") or raw.get("symbol") or raw.get("asset", {}).get("ticker") or ""
-        )
-        ticker = ticker.upper().strip()
+            raw.get("ticker") or raw.get("symbol")
+            or (raw.get("asset") or {}).get("ticker") or ""
+        ).upper().strip()
         if not ticker:
             return None
+        tt = (raw.get("type") or raw.get("transactionType") or "").lower()
+        if "buy" in tt or "purchase" in tt:
+            tt = "buy"
+        elif "sell" in tt or "sale" in tt:
+            tt = "sell"
+        else:
+            return None
+        amt = str(raw.get("amount") or raw.get("size") or raw.get("value") or "")
+        date_str = str(
+            raw.get("date") or raw.get("tradeDate") or raw.get("transactionDate") or ""
+        )
+        d = _parse_date(date_str)
+        if d is None:
+            return None
+        return {"ticker": ticker, "type": tt, "amount": amt, "amount_mid": _parse_amount(amt), "date": d}
+    except Exception:
+        return None
 
-        trade_type = (raw.get("type") or raw.get("transactionType") or "").lower()
-        if "buy" in trade_type or "purchase" in trade_type:
-            trade_type = "buy"
-        elif "sell" in trade_type or "sale" in trade_type:
-            trade_type = "sell"
+
+def _parse_html_row(row) -> dict | None:
+    try:
+        cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+        ticker = next((t for t in cells if re.fullmatch(r"[A-Z]{1,5}", t)), None)
+        if not ticker:
+            return None
+        tt = None
+        for c in cells:
+            lc = c.lower()
+            if "buy" in lc or "purchase" in lc:
+                tt = "buy"; break
+            if "sell" in lc or "sale" in lc:
+                tt = "sell"; break
+        if tt is None:
+            return None
+        amt = next((c for c in cells if "$" in c or re.search(r"\d{1,3},\d{3}", c)), "")
+        d = next((d for c in cells if (d := _parse_date(c)) is not None), None)
+        if d is None:
+            return None
+        return {"ticker": ticker, "type": tt, "amount": amt, "amount_mid": _parse_amount(amt), "date": d}
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Source 2: Official House PTR (Periodic Transaction Reports)
+# Zip files published at disclosures-clerk.house.gov — no auth, no bot block
+# ---------------------------------------------------------------------------
+
+# Module-level cache: {year: [raw_row_dicts]}
+_house_ptr_cache: dict[int, list[dict]] = {}
+
+
+def _fetch_house_ptr_year(year: int) -> list[dict]:
+    """Download and parse the House PTR CSV for one calendar year."""
+    if year in _house_ptr_cache:
+        return _house_ptr_cache[year]
+
+    url = f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}FDptr.zip"
+    logger.info("Downloading House PTR data for %d …", year)
+    r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+
+    rows: list[dict] = []
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        csv_names = [n for n in zf.namelist() if n.lower().endswith((".csv", ".txt"))]
+        for csv_name in csv_names:
+            with zf.open(csv_name) as f:
+                reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig", errors="replace"))
+                rows.extend(reader)
+
+    _house_ptr_cache[year] = rows
+    logger.info("House PTR %d: %d rows loaded", year, len(rows))
+    return rows
+
+
+def _house_ptr_all_rows(days: int) -> list[dict]:
+    cutoff_year = (datetime.now(tz=timezone.utc) - timedelta(days=days)).year
+    current_year = datetime.now(tz=timezone.utc).year
+    rows: list[dict] = []
+    for year in range(cutoff_year, current_year + 1):
+        try:
+            rows.extend(_fetch_house_ptr_year(year))
+        except Exception as e:
+            logger.warning("House PTR download failed for %d: %s", year, e)
+    return rows
+
+
+def _house_row_to_trade(row: dict) -> dict | None:
+    """Normalise a House PTR CSV row into a trade dict."""
+    try:
+        ticker = (row.get("Ticker") or "").strip().upper()
+        # Some rows use asset description if no ticker
+        if not ticker or not re.fullmatch(r"[A-Z]{1,5}", ticker):
+            return None
+
+        tt_raw = (row.get("TransactionType") or "").lower()
+        if "purchase" in tt_raw or "buy" in tt_raw:
+            tt = "buy"
+        elif "sale" in tt_raw or "sell" in tt_raw:
+            tt = "sell"
+        elif "exchange" in tt_raw:
+            tt = "buy"  # treat exchange as buy
         else:
             return None
 
-        amount_str = str(raw.get("amount") or raw.get("size") or raw.get("value") or "")
-        amount_mid = _parse_amount(amount_str)
-
-        date_str = str(raw.get("date") or raw.get("tradeDate") or raw.get("transactionDate") or "")
-        trade_date = _parse_date(date_str)
-        if trade_date is None:
+        amt = row.get("Amount") or ""
+        # Prefer TransactionDate; fall back to FilingDate
+        d = _parse_date(row.get("TransactionDate") or row.get("FilingDate") or "")
+        if d is None:
             return None
 
+        first = (row.get("First") or "").strip()
+        last  = (row.get("Last")  or "").strip()
+        name  = f"{first} {last}".strip()
+        pol_id = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
         return {
-            "ticker":     ticker,
-            "type":       trade_type,
-            "amount":     amount_str,
-            "amount_mid": amount_mid,
-            "date":       trade_date,
+            "ticker":           ticker,
+            "type":             tt,
+            "amount":           amt,
+            "amount_mid":       _parse_amount(amt),
+            "date":             d,
+            "politician_name":  name,
+            "politician_id":    pol_id,
         }
     except Exception:
         return None
 
 
-def _parse_trade_row(row) -> dict | None:
-    """Parse a BeautifulSoup <tr> element into a trade dict."""
-    try:
-        cells = row.find_all(["td", "th"])
-        text_cells = [c.get_text(strip=True) for c in cells]
-
-        # Find ticker (1–5 uppercase letters)
-        ticker = next(
-            (t for t in text_cells if re.fullmatch(r"[A-Z]{1,5}", t)),
-            None,
-        )
-        if not ticker:
-            return None
-
-        # Find trade type
-        trade_type = None
-        for cell in text_cells:
-            lc = cell.lower()
-            if "buy" in lc or "purchase" in lc:
-                trade_type = "buy"
-                break
-            if "sell" in lc or "sale" in lc:
-                trade_type = "sell"
-                break
-        if trade_type is None:
-            return None
-
-        # Find amount range (look for $ or range-like text)
-        amount_str = next(
-            (t for t in text_cells if "$" in t or re.search(r"\d{1,3},\d{3}", t)),
-            "",
-        )
-        amount_mid = _parse_amount(amount_str)
-
-        # Find date (YYYY-MM-DD or MM/DD/YYYY)
-        date_obj = None
-        for cell in text_cells:
-            date_obj = _parse_date(cell)
-            if date_obj:
-                break
-        if date_obj is None:
-            return None
-
-        return {
-            "ticker":     ticker,
-            "type":       trade_type,
-            "amount":     amount_str,
-            "amount_mid": amount_mid,
-            "date":       date_obj,
-        }
-    except Exception:
-        return None
+def _house_get_politicians(days: int = 365) -> list[dict]:
+    rows = _house_ptr_all_rows(days)
+    seen: dict[str, dict] = {}
+    for row in rows:
+        first = (row.get("First") or "").strip()
+        last  = (row.get("Last")  or "").strip()
+        name  = f"{first} {last}".strip()
+        pol_id = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        if pol_id and pol_id not in seen:
+            seen[pol_id] = {"id": pol_id, "name": name, "party": "", "state": ""}
+    return list(seen.values())
 
 
-def _parse_date(text: str) -> datetime | None:
-    """Try several date formats; return timezone-aware datetime or None."""
-    text = text.strip()
-    short_formats = ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"]
-    long_formats  = ["%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y"]
-    for fmt in short_formats:
+def _house_get_trades(politician_id: str, days: int = 365) -> list[dict]:
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+    rows = _house_ptr_all_rows(days)
+    trades = []
+    for row in rows:
+        t = _house_row_to_trade(row)
+        if t and t["politician_id"] == politician_id and t["date"] >= cutoff:
+            trades.append(t)
+    return trades
+
+
+# ---------------------------------------------------------------------------
+# Public API — tries capitoltrades.com, falls back to House PTR
+# ---------------------------------------------------------------------------
+
+_use_house_fallback: bool = False  # set True after first CT failure
+
+
+def get_politicians() -> list[dict]:
+    global _use_house_fallback
+    if not _use_house_fallback:
         try:
-            return datetime.strptime(text[:10], fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
-    for fmt in long_formats:
+            pols = _ct_get_politicians()
+            if pols:
+                logger.info("capitoltrades.com: %d politicians", len(pols))
+                return pols
+        except Exception as e:
+            logger.warning("capitoltrades.com unavailable (%s) — switching to House PTR fallback", e)
+            _use_house_fallback = True
+
+    logger.info("Using House PTR fallback data source")
+    return _house_get_politicians()
+
+
+def get_politician_trades(politician_id: str, days: int = 365) -> list[dict]:
+    global _use_house_fallback
+    if not _use_house_fallback:
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
-    # ISO 8601 with time component
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        pass
-    return None
+            return _ct_get_trades(politician_id, days)
+        except Exception as e:
+            logger.warning("capitoltrades.com failed for %s (%s) — using House PTR", politician_id, e)
+            _use_house_fallback = True
+
+    return _house_get_trades(politician_id, days)
