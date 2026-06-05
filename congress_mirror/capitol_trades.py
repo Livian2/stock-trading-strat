@@ -295,10 +295,10 @@ def _load_via_playwright(days: int) -> list[dict]:
     """
     Drive a real headless Chromium via Playwright.
 
-    The browser passes Cloudflare's full challenge (TLS + JS + fingerprint).
-    We then use context.request.get() — Playwright's own HTTP client — which
-    sends the same cookies (including cf_clearance) but bypasses the CORS/CSP
-    restrictions that block page.evaluate(fetch(...)).
+    Strategy: navigate the browser directly to each BFF URL. Cloudflare
+    serves a JS interstitial for bff.capitoltrades.com on the first hit;
+    Chromium executes it and gets a cf_clearance cookie for that subdomain.
+    Subsequent navigations are direct JSON responses.
 
     Requires:
         pip install playwright
@@ -317,15 +317,15 @@ def _load_via_playwright(days: int) -> list[dict]:
             locale="en-US",
         )
         page = ctx.new_page()
-        logger.info("Playwright: navigating to capitoltrades.com to pass Cloudflare …")
-        page.goto("https://www.capitoltrades.com/trades", wait_until="domcontentloaded",
-                  timeout=60_000)
-        # Give Cloudflare's JS challenge time to complete and set cf_clearance cookie
+
+        # Warm-up: visit the main site so we look like a real session
+        logger.info("Playwright: warming up at capitoltrades.com …")
         try:
-            page.wait_for_load_state("networkidle", timeout=30_000)
-        except Exception:
-            pass
-        time.sleep(2)  # extra buffer for Cloudflare cookie to be written
+            page.goto("https://www.capitoltrades.com/trades",
+                      wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_load_state("networkidle", timeout=20_000)
+        except Exception as e:
+            logger.info("Playwright warm-up note: %s", e)
 
         page_num = 1
         while True:
@@ -334,34 +334,44 @@ def _load_via_playwright(days: int) -> list[dict]:
                 "https://bff.capitoltrades.com/trades"
                 f"?page={page_num}&pageSize=96&sortBy=-txDate"
             )
-            # Use context.request rather than page.evaluate(fetch()), which fails
-            # due to Cloudflare's CORS/CSP headers blocking cross-origin JS fetches
-            response = ctx.request.get(
-                url,
-                headers={
-                    "Accept":          "application/json, text/plain, */*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer":         "https://www.capitoltrades.com/trades",
-                    "Origin":          "https://www.capitoltrades.com",
-                    "Sec-Fetch-Dest":  "empty",
-                    "Sec-Fetch-Mode":  "cors",
-                    "Sec-Fetch-Site":  "same-site",
-                },
-                timeout=30_000,
-            )
 
-            if not response.ok:
-                logger.warning("Playwright BFF returned HTTP %d", response.status)
-                break
+            # Navigate the page directly to the BFF URL. On the first hit
+            # Cloudflare may serve a JS challenge; Chromium runs it and we
+            # end up with the JSON response in the page body.
+            payload = None
+            for attempt in range(3):
+                try:
+                    response = page.goto(url, wait_until="domcontentloaded",
+                                         timeout=45_000)
+                except Exception as e:
+                    logger.warning("Playwright navigate error: %s", e)
+                    time.sleep(2)
+                    continue
 
-            try:
-                payload = response.json()
-            except Exception as e:
-                logger.warning("Playwright BFF non-JSON response: %s", e)
-                break
+                # If Cloudflare interstitial, give its JS time to complete
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20_000)
+                except Exception:
+                    pass
+
+                status = response.status if response else 0
+                body = page.evaluate("() => document.body ? document.body.innerText : ''")
+
+                # Try to parse JSON straight out of the page body
+                try:
+                    payload = json.loads(body)
+                    break
+                except (ValueError, TypeError):
+                    # Still on Cloudflare challenge page – wait and retry
+                    if "Just a moment" in (body or "") or status in (403, 503):
+                        logger.info("  Cloudflare challenge in progress, retrying…")
+                        time.sleep(4)
+                        continue
+                    logger.warning("Playwright BFF non-JSON response (HTTP %d)", status)
+                    break
 
             if not isinstance(payload, dict):
-                logger.warning("Playwright BFF unexpected payload type: %s", type(payload))
+                logger.warning("Playwright: could not get JSON from BFF page %d", page_num)
                 break
 
             rows = payload.get("data") or []
@@ -383,7 +393,7 @@ def _load_via_playwright(days: int) -> list[dict]:
             if stop or page_num >= total_pages:
                 break
             page_num += 1
-            time.sleep(0.4)
+            time.sleep(0.5)
 
         browser.close()
 
