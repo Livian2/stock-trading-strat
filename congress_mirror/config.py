@@ -2,7 +2,8 @@
 import os
 from pathlib import Path
 
-_env_path = Path(__file__).parent.parent / ".env"
+_root = Path(__file__).parent.parent
+_env_path = _root / ".env" if (_root / ".env").exists() else _root / ".env.example"
 if _env_path.exists():
     for line in _env_path.read_text().splitlines():
         line = line.strip()
