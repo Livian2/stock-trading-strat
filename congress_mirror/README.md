@@ -39,10 +39,17 @@ The data layer tries these in order, using the first one that produces rows:
 
 1. **Manual file** at `data/congress_trades.json` or `data/congress_trades.csv`
    (whatever you drop in overrides everything else).
-2. **capitoltrades.com BFF JSON API** via `curl_cffi` — uses a real Chrome TLS
-   fingerprint, so Cloudflare lets it through. This is the primary online source
-   and covers both chambers.
-3. **House + Senate Stock Watcher** public S3 buckets (legacy; usually returns
+2. **Playwright** (real headless Chromium) — passes the full Cloudflare
+   challenge and calls the BFF API from inside the page so it inherits the
+   `cf_clearance` cookie. **Most reliable.** Requires a one-time setup:
+   ```
+   pip install playwright
+   playwright install chromium
+   ```
+3. **capitoltrades.com BFF JSON API** via `curl_cffi` — bare HTTP with a
+   spoofed Chrome TLS fingerprint. Faster than Playwright but often blocked
+   by Cloudflare's JS challenge.
+4. **House + Senate Stock Watcher** public S3 buckets (legacy; usually returns
    403 now but we still try in case they come back).
 
 If the online sources are blocked from your network, **the manual file is the

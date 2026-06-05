@@ -124,7 +124,23 @@ def cmd_diagnose() -> None:
             print(f"  FAIL {host}: {e}")
 
     print("\n=== Data sources (HTTP) ===")
-    # capitoltrades via curl_cffi (primary)
+    # Playwright (most reliable)
+    try:
+        import playwright  # noqa: F401
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                browser.close()
+            print("  Playwright + Chromium: INSTALLED (recommended path)")
+        except Exception as e:
+            print(f"  Playwright installed but browser missing: {e}")
+            print("    Fix: playwright install chromium")
+    except ImportError:
+        print("  Playwright: NOT INSTALLED")
+        print("    Most reliable fix: pip install playwright && playwright install chromium")
+
+    # capitoltrades via curl_cffi (fallback)
     try:
         from curl_cffi import requests as cffi_requests
         s = cffi_requests.Session(impersonate="chrome120")

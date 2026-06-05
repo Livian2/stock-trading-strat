@@ -291,6 +291,88 @@ def _normalize_bff_trade(raw: dict) -> dict | None:
         return None
 
 
+def _load_via_playwright(days: int) -> list[dict]:
+    """
+    Drive a real headless Chromium via Playwright.
+
+    The browser passes Cloudflare's full challenge (TLS + JS + fingerprint),
+    then we call the BFF API from inside the page so it inherits the
+    cf_clearance cookie. This is the most reliable path against modern
+    Cloudflare protections.
+
+    Requires:
+        pip install playwright
+        playwright install chromium
+    """
+    from playwright.sync_api import sync_playwright  # imported lazily
+
+    cutoff = datetime.now(tz=UTC) - timedelta(days=days)
+    out: list[dict] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=_UA,
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+        )
+        page = ctx.new_page()
+        logger.info("Playwright: navigating to capitoltrades.com to pass Cloudflare …")
+        page.goto("https://www.capitoltrades.com/trades", wait_until="domcontentloaded",
+                  timeout=60_000)
+        # Give Cloudflare's JS challenge a moment, then wait for the page to settle
+        page.wait_for_load_state("networkidle", timeout=30_000)
+
+        page_num = 1
+        while True:
+            logger.info("Playwright: fetching BFF page %d …", page_num)
+            url = (
+                "https://bff.capitoltrades.com/trades"
+                f"?page={page_num}&pageSize=96&sortBy=-txDate"
+            )
+            payload = page.evaluate(
+                """async (u) => {
+                    const r = await fetch(u, {
+                        headers: { 'Accept': 'application/json' },
+                        credentials: 'include'
+                    });
+                    if (!r.ok) return { __error: r.status };
+                    return await r.json();
+                }""",
+                url,
+            )
+
+            if not isinstance(payload, dict) or payload.get("__error"):
+                logger.warning("Playwright BFF returned %s", payload)
+                break
+
+            rows = payload.get("data") or []
+            if not rows:
+                break
+
+            stop = False
+            for raw in rows:
+                t = _normalize_bff_trade(raw)
+                if t is None:
+                    continue
+                if t["date"] < cutoff:
+                    stop = True
+                    continue
+                out.append(t)
+
+            meta = (payload.get("meta") or {}).get("paging") or {}
+            total_pages = int(meta.get("totalPages") or 1)
+            if stop or page_num >= total_pages:
+                break
+            page_num += 1
+            time.sleep(0.4)
+
+        browser.close()
+
+    logger.info("Playwright: %d usable trades", len(out))
+    return out
+
+
 def _load_capitoltrades(days: int) -> list[dict]:
     cutoff = datetime.now(tz=UTC) - timedelta(days=days)
     session, backend = _bff_session()
@@ -434,13 +516,28 @@ def _load_from_sources(days: int) -> list[dict]:
 
     collected: list[dict] = []
 
-    # 2. capitoltrades.com BFF (primary online source)
+    # 2. Playwright (real browser, defeats full Cloudflare challenge)
     try:
-        collected = _load_capitoltrades(days)
-    except Exception as e:
-        logger.warning("capitoltrades.com unavailable: %s", e)
+        import playwright  # noqa: F401 — just to detect if installed
+        try:
+            collected = _load_via_playwright(days)
+        except Exception as e:
+            logger.warning("Playwright path failed: %s", e)
+    except ImportError:
+        logger.info(
+            "Playwright not installed – skipping. For the most reliable path:\n"
+            "    pip install playwright\n"
+            "    playwright install chromium"
+        )
 
-    # 3. Stock Watcher S3 buckets (legacy; usually 403 now)
+    # 3. capitoltrades.com BFF directly (curl_cffi). Often blocked by Cloudflare.
+    if not collected:
+        try:
+            collected = _load_capitoltrades(days)
+        except Exception as e:
+            logger.warning("capitoltrades.com (direct) unavailable: %s", e)
+
+    # 4. Stock Watcher S3 buckets (legacy; usually 403 now)
     if not collected:
         for url, chamber in ((HOUSE_SW_URL, "house"), (SENATE_SW_URL, "senate")):
             try:
@@ -451,7 +548,8 @@ def _load_from_sources(days: int) -> list[dict]:
     if not collected:
         raise RuntimeError(
             "All congressional data sources failed.\n"
-            "  Try: pip install curl_cffi   (real Chrome TLS fingerprint)\n"
+            "  Most reliable fix:\n"
+            "    pip install playwright && playwright install chromium\n"
             "  Then: python run_mirror.py diagnose\n"
             "  Or:  drop a manual export at data/congress_trades.json\n"
             "       (schema in congress_mirror/README.md)"
