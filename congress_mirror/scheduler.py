@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
-import schedule
 import pytz
+import schedule
 
 from .mirror import run_full_cycle
 from .notifier import send_summary
@@ -84,7 +84,5 @@ def start(dry_run: bool = False) -> None:
     _run_job(dry_run=dry_run)
 
     while True:
-        now_utc = datetime.now(tz=timezone.utc)
-        # Convert to ET to check if it's 09:30
         schedule.run_pending()
         time.sleep(30)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import smtplib
 import textwrap
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -51,7 +51,7 @@ def send_summary(summary: dict) -> bool:
 
 def _build_email(s: dict) -> tuple[str, str, str]:
     """Return (subject, html, plaintext) for the summary dict."""
-    run_at = s.get("run_at", datetime.now(tz=timezone.utc).isoformat())
+    run_at = s.get("run_at", datetime.now(tz=UTC).isoformat())
     top = s.get("top_performer") or {}
     ranked = s.get("ranked", [])
     new_disc = s.get("new_disclosures", [])

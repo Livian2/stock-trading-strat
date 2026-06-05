@@ -13,7 +13,7 @@ Only considers buys that have NOT been matched by a subsequent sell disclosure.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import yfinance as yf
 

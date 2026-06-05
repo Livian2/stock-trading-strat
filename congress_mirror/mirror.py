@@ -1,25 +1,24 @@
 """
-Core orchestration: scrape → rank → mirror.
+Core orchestration: fetch → rank → mirror.
 
 Flow
 ----
-1. Fetch politicians list from capitoltrades.com.
-2. For each politician with enough trades, fetch their 12-month trade history.
-3. Rank by hypothetical return (buy-and-hold from disclosure date → today).
-4. Mirror the top performer's open positions into the Alpaca paper account.
-5. Return a summary dict for use in email / logging.
+1. Download all congressional trades for the lookback window (one bulk fetch).
+2. Rank politicians by hypothetical return (buy-and-hold from disclosure → today).
+3. Mirror the top performer's open positions into the Alpaca paper account.
+4. Return a summary dict for use in email / logging.
 """
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import config
 from .alpaca_client import AlpacaClient
-from .capitol_trades import get_politician_trades, get_politicians
-from .returns import calculate_returns, get_open_positions, rank_politicians
+from .capitol_trades import clear_cache, get_all_trades
+from .returns import get_open_positions, rank_politicians
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +56,7 @@ def run_full_cycle(dry_run: bool = False) -> dict:
     errors: list[str] = []
     state = _load_state()
     summary: dict = {
-        "run_at":           datetime.now(tz=timezone.utc).isoformat(),
+        "run_at":           datetime.now(tz=UTC).isoformat(),
         "top_performer":    None,
         "ranked":           [],
         "new_disclosures":  [],
@@ -67,39 +66,22 @@ def run_full_cycle(dry_run: bool = False) -> dict:
     }
 
     # ------------------------------------------------------------------
-    # 1. Fetch politician list
+    # 1. Fetch all congressional trades for the lookback window (one bulk call)
     # ------------------------------------------------------------------
-    logger.info("Fetching politician list from capitoltrades.com …")
+    clear_cache()  # force fresh data each daily cycle
+    logger.info("Fetching congressional trade data …")
     try:
-        politicians = get_politicians()
+        all_trades = get_all_trades(days=config.LOOKBACK_DAYS)
     except Exception as e:
-        msg = f"Failed to fetch politician list: {e}"
+        msg = f"Failed to fetch trade data: {e}"
         logger.error(msg)
         errors.append(msg)
         return summary
 
-    logger.info("Found %d politicians", len(politicians))
-
-    # ------------------------------------------------------------------
-    # 2. Fetch trades for each politician
-    # ------------------------------------------------------------------
-    all_trades: dict[str, list[dict]] = {}
-    for pol in politicians:
-        pol_id = pol["id"]
-        if not pol_id:
-            continue
-        try:
-            trades = get_politician_trades(pol_id, days=config.LOOKBACK_DAYS)
-            # Attach politician name to each trade for downstream display
-            for t in trades:
-                t["politician_name"] = pol.get("name", pol_id)
-                t["politician_id"] = pol_id
-            if len([t for t in trades if t["type"] == "buy"]) >= config.MIN_TRADES:
-                all_trades[pol_id] = trades
-                logger.info("  %s: %d trades", pol.get("name", pol_id), len(trades))
-        except Exception as e:
-            logger.warning("Could not fetch trades for %s: %s", pol_id, e)
-
+    logger.info(
+        "Loaded trades for %d politicians (%d total trades)",
+        len(all_trades), sum(len(v) for v in all_trades.values()),
+    )
     if not all_trades:
         errors.append("No politician trade data retrieved.")
         return summary
